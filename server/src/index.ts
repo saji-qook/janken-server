@@ -174,6 +174,17 @@ function normalizeIp(addr: string | undefined): string {
   return addr.replace(/^::ffff:/, ''); // IPv4-mapped IPv6 を素のIPv4へ
 }
 
+/**
+ * 実クライアントIPを得る。Render等のプロキシ配下では handshake.address が
+ * プロキシIP（全員共通）になり同一NW判定が誤作動するため、X-Forwarded-For を優先する。
+ */
+function clientIp(sock: { handshake: { address: string; headers: Record<string, string | string[] | undefined> } }): string {
+  const xff = sock.handshake.headers['x-forwarded-for'];
+  const raw = Array.isArray(xff) ? xff[0] : xff;
+  if (raw) return normalizeIp(String(raw).split(',')[0]!.trim());
+  return normalizeIp(sock.handshake.address);
+}
+
 /** 同一IP、または同一ネットワーク(IPv4 /24)か。 */
 function sameNetwork(a: string, b: string): boolean {
   if (!a || !b) return false;
@@ -191,7 +202,7 @@ function makeSeat(socketId: string): MatchSeat {
   return {
     socketId,
     name: names(socketId),
-    ip: normalizeIp(sock.handshake.address),
+    ip: clientIp(sock),
     emit: (view, deadline) => sock.emit('view', { view, deadline }),
     error: (code, message) => sock.emit('error:msg', { code, message }),
     oppLeft: () => sock.emit('opponent:left'),
