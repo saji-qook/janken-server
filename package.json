@@ -1,0 +1,12 @@
+{
+  "name": "janken-online-server",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "game-core",
+    "server"
+  ],
+  "scripts": {
+    "start": "npm -w @janken/server run start"
+  }
+}
