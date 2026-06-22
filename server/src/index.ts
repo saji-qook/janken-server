@@ -221,25 +221,37 @@ function pair(aId: string, bId: string, isPrivate = false) {
   const match = new ServerMatch([makeSeat(aId), makeSeat(bId)], () => endMatch(match), isPrivate);
   matches.set(aId, match);
   matches.set(bId, match);
-  io.sockets.sockets.get(aId)?.emit('match:found', { opponentName: bn });
-  io.sockets.sockets.get(bId)?.emit('match:found', { opponentName: an });
+  const aSock = io.sockets.sockets.get(aId);
+  const bSock = io.sockets.sockets.get(bId);
+  // 「直前の相手」を記録（次回マッチで同名連続を避けるため）
+  if (aSock) aSock.data.lastOpp = bn;
+  if (bSock) bSock.data.lastOpp = an;
+  aSock?.emit('match:found', { opponentName: bn });
+  bSock?.emit('match:found', { opponentName: an });
   match.start();
 }
 
 function tryMatchmake() {
-  while (queue.length >= 2) {
-    // 待機者からランダムに2名を選ぶ。
+  while (true) {
+    // 切断済みの待機者を除去してから判定。
+    queue = queue.filter((w) => io.sockets.sockets.get(w.socketId));
+    if (queue.length < 2) break;
+
+    // a をランダムに取り出す。
     const a = queue.splice(Math.floor(Math.random() * queue.length), 1)[0]!;
-    const b = queue.splice(Math.floor(Math.random() * queue.length), 1)[0]!;
-    // どちらかが既に切断していたら戻してやり直し。
-    if (!io.sockets.sockets.get(a.socketId)) {
-      if (io.sockets.sockets.get(b.socketId)) queue.push(b);
-      continue;
-    }
-    if (!io.sockets.sockets.get(b.socketId)) {
-      queue.push(a);
-      continue;
-    }
+    const aName = names(a.socketId);
+    const aLastOpp = io.sockets.sockets.get(a.socketId)?.data.lastOpp as string | undefined;
+
+    // b は「直前の相手と同じ名前にならない」人を優先（不正防止・連戦回避）。
+    let bIdx = queue.findIndex((w) => {
+      const wName = names(w.socketId);
+      const wLastOpp = io.sockets.sockets.get(w.socketId)?.data.lastOpp as string | undefined;
+      return wName !== aLastOpp && wLastOpp !== aName;
+    });
+    // 候補がいなければ（全員が同名連続になる等）妥協してランダムに選ぶ。
+    if (bIdx === -1) bIdx = Math.floor(Math.random() * queue.length);
+    const b = queue.splice(bIdx, 1)[0]!;
+
     pair(a.socketId, b.socketId);
   }
   broadcastPresence();
