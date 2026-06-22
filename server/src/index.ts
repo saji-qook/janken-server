@@ -8,6 +8,7 @@ import { createServer } from 'node:http';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Server } from 'socket.io';
+import { Redis } from '@upstash/redis';
 import type {
   ClientToServer,
   ServerToClient,
@@ -57,6 +58,16 @@ function broadcastPresence() {
 // --- 連続勝利数ランキング（ニックネーム別の最高連勝） -----------------------
 
 const RANKING_FILE = fileURLToPath(new URL('../ranking.json', import.meta.url));
+// 永続ストア: 環境変数があれば Upstash Redis を使う（再起動・再デプロイでも消えない）。
+// 無ければローカルのファイルにフォールバック（開発用）。
+const redis =
+  process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
+    ? new Redis({
+        url: process.env.UPSTASH_REDIS_REST_URL,
+        token: process.env.UPSTASH_REDIS_REST_TOKEN,
+      })
+    : null;
+const REDIS_KEY = 'janken:ranking';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 const RECORD_TTL = WEEK_MS + DAY_MS; // 8日より古い記録は破棄（日/週集計に十分）
@@ -74,26 +85,45 @@ function pruneRecords() {
   streakRecords = streakRecords.filter((r) => r.at >= cutoff);
 }
 
-function loadRanking() {
+function applyLoaded(raw: unknown) {
+  if (raw && typeof raw === 'object' && ('best' in raw || 'records' in raw)) {
+    const obj = raw as { best?: Record<string, number>; records?: StreakRecord[] };
+    for (const [name, n] of Object.entries(obj.best ?? {})) bestStreaks.set(name, n);
+    if (Array.isArray(obj.records)) streakRecords = obj.records;
+  } else if (raw && typeof raw === 'object') {
+    // 旧形式 { name: number } からの移行（全期間のみ）
+    for (const [name, n] of Object.entries(raw as Record<string, number>)) bestStreaks.set(name, n as number);
+  }
+  pruneRecords();
+}
+
+async function loadRanking() {
   try {
-    const raw = JSON.parse(readFileSync(RANKING_FILE, 'utf8')) as unknown;
-    if (raw && typeof raw === 'object' && ('best' in raw || 'records' in raw)) {
-      const obj = raw as { best?: Record<string, number>; records?: StreakRecord[] };
-      for (const [name, n] of Object.entries(obj.best ?? {})) bestStreaks.set(name, n);
-      if (Array.isArray(obj.records)) streakRecords = obj.records;
-    } else if (raw && typeof raw === 'object') {
-      // 旧形式 { name: number } からの移行（全期間のみ）
-      for (const [name, n] of Object.entries(raw as Record<string, number>)) bestStreaks.set(name, n);
+    if (redis) {
+      const raw = await redis.get(REDIS_KEY); // Upstash は JSON を自動でパースして返す
+      if (raw) applyLoaded(raw);
+      console.log('[ranking] Upstash Redis からロードしました');
+      return;
     }
-    pruneRecords();
-  } catch {
-    /* 初回は無し */
+    applyLoaded(JSON.parse(readFileSync(RANKING_FILE, 'utf8')));
+  } catch (e) {
+    console.error('[ranking] load 失敗（初回なら無視）', e);
   }
 }
+
+let _saveTimer: ReturnType<typeof setTimeout> | null = null;
 function saveRanking() {
+  pruneRecords();
+  const data = { best: Object.fromEntries(bestStreaks), records: streakRecords };
+  if (redis) {
+    // 連続更新をまとめて書く（Upstash 無料枠のリクエスト節約）
+    if (_saveTimer) clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(() => {
+      redis.set(REDIS_KEY, data).catch((e) => console.error('[ranking] Redis 保存失敗', e));
+    }, 1000);
+    return;
+  }
   try {
-    pruneRecords();
-    const data = { best: Object.fromEntries(bestStreaks), records: streakRecords };
     writeFileSync(RANKING_FILE, JSON.stringify(data), 'utf8');
   } catch {
     /* 失敗は無視 */
@@ -167,7 +197,7 @@ function updateStreaks(match: ServerMatch) {
   broadcastRanking();
 }
 
-loadRanking();
+await loadRanking(); // 永続ストアから読み込み完了を待ってから稼働（保存上書き防止）
 
 function normalizeIp(addr: string | undefined): string {
   if (!addr) return '';
